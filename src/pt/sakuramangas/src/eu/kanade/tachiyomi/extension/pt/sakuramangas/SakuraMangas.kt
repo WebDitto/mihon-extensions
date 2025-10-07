@@ -6,7 +6,7 @@ import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.view.View
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -21,7 +21,10 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.parseAs
+import okhttp3.Cookie
+import okhttp3.CookieJar
 import okhttp3.FormBody
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
@@ -56,14 +59,34 @@ class SakuraMangas : HttpSource() {
     )
 
     override fun headersBuilder() = super.headersBuilder()
-        .set("Origin", baseUrl)
         .set("Referer", "$baseUrl/")
-        .set(
-            "Accept-Language",
-            "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7,fr;q=0.6,zh-CN;q=0.5,zh-TW;q=0.4,zh;q=0.3",
-        )
+        .set("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
         .set("Connection", "keep-alive")
         .set("X-Requested-With", "XMLHttpRequest")
+
+    override val client = network.cloudflareClient.newBuilder()
+        .cookieJar(
+            object : CookieJar {
+                private val cookieManager by lazy { CookieManager.getInstance() }
+
+                override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+                    val urlString = url.toString()
+                    cookies.forEach { cookieManager.setCookie(urlString, it.toString()) }
+                }
+
+                override fun loadForRequest(url: HttpUrl): List<Cookie> {
+                    val cookies = cookieManager.getCookie(url.toString())
+
+                    return if (cookies != null && cookies.isNotEmpty()) {
+                        cookies.split(";").mapNotNull {
+                            Cookie.parse(url, it)
+                        }
+                    } else {
+                        emptyList()
+                    }
+                }
+            },
+        ).build()
 
     // ================================ Popular =======================================
 
@@ -174,7 +197,6 @@ class SakuraMangas : HttpSource() {
             innerWv.settings.javaScriptEnabled = true
             innerWv.settings.blockNetworkImage = true
             innerWv.settings.userAgentString = headers["User-Agent"]
-            innerWv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
             innerWv.addJavascriptInterface(jsInterface, interfaceName)
 
             innerWv.webViewClient = object : WebViewClient() {
@@ -261,7 +283,6 @@ class SakuraMangas : HttpSource() {
             innerWv.settings.javaScriptEnabled = true
             innerWv.settings.blockNetworkImage = true
             innerWv.settings.userAgentString = headers["User-Agent"]
-            innerWv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
             innerWv.addJavascriptInterface(jsInterface, interfaceName)
 
             innerWv.webViewClient = object : WebViewClient() {
@@ -357,7 +378,6 @@ class SakuraMangas : HttpSource() {
             innerWv.settings.javaScriptEnabled = true
             innerWv.settings.blockNetworkImage = true
             innerWv.settings.userAgentString = headers["User-Agent"]
-            innerWv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
             innerWv.addJavascriptInterface(jsInterface, interfaceName)
 
             innerWv.webViewClient = object : WebViewClient() {
