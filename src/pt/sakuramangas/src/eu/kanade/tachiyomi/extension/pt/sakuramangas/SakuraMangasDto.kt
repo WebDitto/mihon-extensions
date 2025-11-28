@@ -1,10 +1,27 @@
 package eu.kanade.tachiyomi.extension.pt.sakuramangas
 
+import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+
+@Serializable
+class SakuraMangasLatestDto(
+    private val titulo: String,
+    private val url_manga: String,
+    private val thumb: String,
+) {
+
+    fun toSManga(baseUri: String = ""): SManga = SManga.create().apply {
+        title = titulo
+        status = SManga.UNKNOWN
+        thumbnail_url = "$baseUri$thumb"
+        url = url_manga
+        initialized = true
+    }
+}
 
 @Serializable
 class SakuraMangasResultDto(
@@ -55,6 +72,60 @@ class SakuraMangaInfoDto(
 }
 
 @Serializable
+class SakuraMangasChaptersDto(
+    val has_more: Boolean,
+    val data: List<SakuraMangasChapterGroupDto>,
+)
+
+@Serializable
+class SakuraMangasChapterGroupDto(
+    val numero: Float,
+    val data_timestamp: Long,
+    val versoes: List<SakuraMangasChapterVersionDto>,
+) {
+    fun toSChapter(): SChapter = SChapter.create().apply {
+        val first = versoes.first()
+        val numeroFormatted = if (numero.rem(1f) == 0f) {
+            numero.toInt().toString()
+        } else {
+            numero.toString()
+        }
+        url = first.url
+        name = "Cap. $numeroFormatted${first.titulo?.let { " - $it" } ?: ""}"
+        date_upload = data_timestamp * 1000
+        chapter_number = numero
+        scanlator = first.scans.joinToString(", ") { it.nome }
+    }
+}
+
+@Serializable
+class SakuraMangasChapterVersionDto(
+    val titulo: String?,
+    val url: String,
+    val scans: List<SakuraMangasChapterScanDto>,
+)
+
+@Serializable
+class SakuraMangasChapterScanDto(
+    val nome: String,
+)
+
+@Serializable
 class SakuraMangaChapterReadDto(
-    val imageUrls: String,
+    val data: SakuraMangaChapterReadDataDto,
+)
+
+@Serializable
+class SakuraMangaChapterReadDataDto(
+    val encryptedUrls: String,
+    val encryptedImageKey: String,
+    val encryptedEphemeralKey: SakuraMangaChapterReadEphemeralKeyDto,
+    val canaryChallenge: String,
+    val canaryResponse: String,
+)
+
+@Serializable
+class SakuraMangaChapterReadEphemeralKeyDto(
+    val cipher: String,
+    val payload: String,
 )

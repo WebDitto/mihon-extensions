@@ -1,7 +1,7 @@
 ext {
     extName = 'Sakura Mangás'
     extClass = '.SakuraMangas'
-    extVersionCode = 3
+    extVersionCode = 4
     isNsfw = true
 }
 
@@ -10,4 +10,5 @@ apply from: "$rootDir/common.gradle"
 dependencies {
     implementation project(":lib:synchrony")
     implementation project(':lib:randomua')
+    implementation project(':lib:webviewfetchinterceptor')
 }

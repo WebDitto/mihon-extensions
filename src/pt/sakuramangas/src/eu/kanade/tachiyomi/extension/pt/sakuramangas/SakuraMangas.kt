@@ -5,9 +5,8 @@ import android.util.Log
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.lib.randomua.addRandomUAPreferenceToScreen
 import eu.kanade.tachiyomi.lib.randomua.getPrefCustomUA
-import eu.kanade.tachiyomi.lib.randomua.getPrefUAType
-import eu.kanade.tachiyomi.lib.randomua.setRandomUserAgent
 import eu.kanade.tachiyomi.lib.synchrony.Deobfuscator
+import eu.kanade.tachiyomi.lib.webviewfetchinterceptor.WebViewFetchInterceptor
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -27,7 +26,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import okio.IOException
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.security.MessageDigest
 import java.util.Calendar
@@ -44,12 +42,17 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
 
     private val preferences = getPreferences()
 
-    override val client = network.cloudflareClient.newBuilder()
-        .setRandomUserAgent(
-            preferences.getPrefUAType(),
-            preferences.getPrefCustomUA(),
-        )
+    override val client = network.client.newBuilder()
         .rateLimit(3, 2)
+        .addInterceptor(
+            WebViewFetchInterceptor(
+                // loadUrl = "$baseUrl/robots.txt", // Lightweight file from same domain
+                filter = { request ->
+                    // Only intercept requests from the same domain to avoid CORS issues
+                    request.url.toString().startsWith(baseUrl)
+                },
+            ),
+        )
         .build()
 
     private var genresSet: Set<Genre> = emptySet()
@@ -65,6 +68,7 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
         .set("X-Requested-With", "XMLHttpRequest")
         .set("Connection", "keep-alive")
         .set("Cache-Control", "no-cache")
@@ -87,15 +91,10 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
         GET("$baseUrl/dist/sakura/models/home/__.home_ultimos.php", headers)
 
     override fun latestUpdatesParse(response: Response): MangasPage {
-        val result = response.parseAs<List<String>>()
+        val result = response.parseAs<List<SakuraMangasLatestDto>>()
 
         val mangas = result.map {
-            val element = Jsoup.parseBodyFragment(it, baseUrl)
-            SManga.create().apply {
-                title = element.selectFirst(".h5-titulo")!!.text()
-                setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
-                thumbnail_url = element.selectFirst("img")?.absUrl("src")
-            }
+            it.toSManga(baseUrl)
         }
 
         return MangasPage(mangas, hasNextPage = false)
@@ -141,7 +140,7 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
         classification?.let { form.add("classification", it) }
         orderBy?.let { form.add("order", it) }
 
-        return POST("$baseUrl/dist/sakura/models/obras/__.obras_buscar.php", headers, form.build())
+        return POST("$baseUrl/dist/sakura/models/obras/__.obras__buscar.php", headers, form.build())
     }
 
     fun searchMangaFromElement(element: Element) = SManga.create().apply {
@@ -173,12 +172,17 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
             .add("proof", proof)
 
         val detailsHeaders = headers.newBuilder()
+            .add("X-Client-Signature", keys.clientSignature)
             .add("X-Verification-Key-1", keys.xVerificationKey1)
             .add("X-Verification-Key-2", keys.xVerificationKey2)
             .add("X-CSRF-Token", token)
             .build()
 
-        return POST("$baseUrl/dist/sakura/models/manga/__obf__manga_info.php", detailsHeaders, form.build())
+        return POST(
+            "$baseUrl/dist/sakura/models/manga/.__obf__manga_info.php",
+            detailsHeaders,
+            form.build(),
+        )
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
@@ -194,19 +198,39 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
     private val keys: Keys by lazy {
         val mangaInfoRegex = """(?:manga_info:\s+)(\d+)""".toRegex()
         val chapterReadRegex = """(?:chapter_read:\s+)(\d+)""".toRegex()
-        val key1Regex = """(?:.Key-1.]\s?=\s+?.)([^']+)""".toRegex()
-        val key2Regex = """(?:.Key-2.]\s?=\s+?.)([^']+)""".toRegex()
+        val keysRegex = """['"]([\w-]{36})['"]""".toRegex()
+        val signatureRegex = """['"](\w{5}-\w{5}-\w{6})['"]""".toRegex()
 
-        val script = client.newCall(GET("$baseUrl/dist/sakura/global/security.oby.js", headers))
+        val doc = client.newCall(GET("$baseUrl/obras/one-piece/", headers))
+            .execute()
+            .asJsoup()
+
+        val securityScriptUrl = doc
+            .selectFirst("script[src*=security]")
+            ?.attr("abs:src")
+            ?: throw IOException("Could not locate the security script")
+
+        val normalizeScriptUrl = doc
+            .selectFirst("script[src*=normalize]")
+            ?.attr("abs:src")
+            ?: throw IOException("Could not locate the normalize script")
+
+        val secureScript = client.newCall(GET(securityScriptUrl, headers))
             .execute().body.string()
 
-        val deobfuscated = Deobfuscator.deobfuscateScript(script)!!
+        val normalizerScript = client.newCall(GET(normalizeScriptUrl, headers))
+            .execute().body.string()
+
+        val deobfuscated = Deobfuscator.deobfuscateScript(secureScript)!!
+
+        val allUuids = keysRegex.findAll(deobfuscated).map { it.groupValues[1] }.toList()
 
         Keys(
             mangaInfo = mangaInfoRegex.find(deobfuscated)?.groupValues?.last()?.toLong() ?: 0L,
             chapterRead = chapterReadRegex.find(deobfuscated)?.groupValues?.last()?.toLong() ?: 0L,
-            xVerificationKey1 = key1Regex.find(deobfuscated)?.groupValues?.last() ?: "",
-            xVerificationKey2 = key2Regex.find(deobfuscated)?.groupValues?.last() ?: "",
+            xVerificationKey1 = allUuids.getOrNull(0) ?: "",
+            xVerificationKey2 = allUuids.getOrNull(1) ?: "",
+            clientSignature = signatureRegex.find(normalizerScript)?.groupValues?.last() ?: "",
         )
     }
 
@@ -215,11 +239,17 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
         val chapterRead: Long,
         val xVerificationKey1: String,
         val xVerificationKey2: String,
+        val clientSignature: String,
     )
 
     // ================================ Chapters =======================================
 
-    private fun chapterListApiRequest(mangaId: String, challenge: String, token: String, page: Int): Request {
+    private fun chapterListApiRequest(
+        mangaId: String,
+        challenge: String,
+        token: String,
+        page: Int,
+    ): Request {
         val proof = generateHeaderProof(challenge, keys.mangaInfo)!!
         val form = FormBody.Builder()
             .add("manga_id", mangaId)
@@ -230,12 +260,17 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
             .add("proof", proof)
 
         val chapterHeaders = headers.newBuilder()
+            .add("X-Client-Signature", keys.clientSignature)
             .add("X-Verification-Key-1", keys.xVerificationKey1)
             .add("X-Verification-Key-2", keys.xVerificationKey2)
             .add("X-CSRF-Token", token)
             .build()
 
-        return POST("$baseUrl/dist/sakura/models/manga/__obf__manga_capitulos.php", chapterHeaders, form.build())
+        return POST(
+            "$baseUrl/dist/sakura/models/manga/.__obf__manga_capitulos.php",
+            chapterHeaders,
+            form.build(),
+        )
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -246,36 +281,19 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
 
         var page = 1
         val chapters = mutableListOf<SChapter>()
+        var result: SakuraMangasChaptersDto
         do {
-            val doc = client.newCall(chapterListApiRequest(mangaId, challenge, token, page++)).execute().asJsoup()
+            result = client
+                .newCall(chapterListApiRequest(mangaId, challenge, token, page++))
+                .execute()
+                .parseAs<SakuraMangasChaptersDto>()
 
-            val chapterGroup = doc.select(".capitulo-item").map(::chapterFromElement).also {
+            val chapterGroup = result.data.map { it.toSChapter() }.also {
                 chapters += it
             }
-        } while (chapterGroup.isNotEmpty())
+        } while (result.has_more)
 
         return chapters
-    }
-
-    fun chapterFromElement(element: Element) = SChapter.create().apply {
-        name = buildString {
-            element.selectFirst(".num-capitulo")
-                ?.text()
-                ?.let { append(it) }
-
-            element.selectFirst(".cap-titulo")
-                ?.text()
-                ?.takeIf { it.isNotBlank() }
-                ?.let { append(" - $it") }
-        }
-        scanlator = element.selectFirst(".scan-nome")?.text()
-        chapter_number =
-            element
-                .selectFirst(".num-capitulo")!!
-                .attr("data-chapter")
-                .toFloatOrNull() ?: 1F
-        date_upload = element.selectFirst(".cap-data")?.text()?.toDate() ?: 0L
-        setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
     }
 
     // ================================ Pages =======================================
@@ -294,13 +312,14 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
             .add("proof", proof)
 
         val pageHeaders = headers.newBuilder()
+            .add("X-Client-Signature", keys.clientSignature)
             .add("X-Verification-Key-1", keys.xVerificationKey1)
             .add("X-Verification-Key-2", keys.xVerificationKey2)
             .add("X-CSRF-Token", csrf)
             .build()
 
         return POST(
-            "$baseUrl/dist/sakura/models/capitulo/__obf__capitulos_read.php",
+            "$baseUrl/dist/sakura/models/capitulo/__obf__capitulos__read.php",
             pageHeaders,
             form.build(),
         )
@@ -315,19 +334,29 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
         val challenge = document.selectFirst("meta[name=header-challenge]")!!.attr("content")
         val csrf = document.selectFirst("meta[name=csrf-token]")!!.attr("content")
 
-        val response = client.newCall(pageListApiRequest(chapterId, token, challenge, csrf)).execute()
-            .parseAs<SakuraMangaChapterReadDto>()
+        val imagesResponse =
+            client.newCall(pageListApiRequest(chapterId, token, challenge, csrf)).execute()
+                .parseAs<SakuraMangaChapterReadDto>()
+
+        val images = YggdrasilCipher.decrypt(imagesResponse.data, subtoken)
+
+        Log.d("SakuraMangas", "images: $images")
 
         val baseUrl = document.baseUri().trimEnd('/')
-
-        return AetherCipher.decrypt(response.imageUrls, subtoken)
-            .parseAs<List<String>>()
-            .mapIndexed { index, url ->
-                Page(index, imageUrl = "$baseUrl/$url".toHttpUrl().toString())
-            }
+        return images.mapIndexed { index, url ->
+            Page(index, imageUrl = "$baseUrl/$url".toHttpUrl().toString())
+        }
     }
 
     override fun imageUrlParse(response: Response): String = ""
+
+    override fun imageRequest(page: Page): Request {
+        val imageHeaders = headers.newBuilder()
+            .set("X-Requested-With", "SakuraMatchClient")
+            .set("X-Signature-Version", "v5-fetch-custom")
+            .build()
+        return GET(page.imageUrl!!, imageHeaders)
+    }
 
     override fun getFilterList(): FilterList {
         thread {
@@ -435,7 +464,7 @@ class SakuraMangas : HttpSource(), ConfigurableSource {
             var result = address + userAgent + key + pathSegment
 
             val digest = MessageDigest.getInstance("SHA-256")
-            repeat(29) {
+            repeat(23) {
                 val data = result.toByteArray(Charsets.UTF_8)
                 val hashBytes = digest.digest(data)
                 digest.reset()
